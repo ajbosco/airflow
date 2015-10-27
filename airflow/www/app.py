@@ -17,7 +17,6 @@ import logging
 import os
 import socket
 import sys
-import time
 import traceback
 
 from flask._compat import PY2
@@ -27,6 +26,7 @@ from flask import (
 from flask.ext.admin import Admin, BaseView, expose, AdminIndexView
 from flask.ext.admin.form import DateTimePickerWidget
 from flask.ext.admin import base
+from flask.ext.admin.actions import action
 from flask.ext.admin.contrib.sqla import ModelView
 from flask.ext.cache import Cache
 from flask import request
@@ -196,17 +196,6 @@ class DateTimeForm(Form):
     # Date filter form needed for gantt and graph view
     execution_date = DateTimeField(
         "Execution date", widget=DateTimePickerWidget())
-
-
-class GraphForm(Form):
-    execution_date = DateTimeField(
-        "Execution date", widget=DateTimePickerWidget())
-    arrange = SelectField("Layout", choices=(
-        ('LR', "Left->Right"),
-        ('RL', "Right->Left"),
-        ('TB', "Top->Bottom"),
-        ('BT', "Bottom->Top"),
-    ))
 
 
 class TreeForm(Form):
@@ -1279,7 +1268,24 @@ class Airflow(BaseView):
         else:
             dttm = dag.latest_execution_date or datetime.now().date()
 
-        form = GraphForm(data={'execution_date': dttm, 'arrange': arrange})
+        DR = models.DagRun
+        drs = session.query(DR).filter_by(dag_id=dag_id).all()
+        dr_choices = []
+        dr_state = None
+        for dr in drs:
+            dr_choices.append((dr.execution_date.isoformat(), dr.run_id))
+            if dttm == dr.execution_date:
+                dr_state = dr.state
+        flash(str(dttm))
+        class GraphForm(Form):
+            execution_date = SelectField("DAG run", choices=dr_choices)
+            arrange = SelectField("Layout", choices=(
+                ('LR', "Left->Right"),
+                ('RL', "Right->Left"),
+                ('TB', "Top->Bottom"),
+                ('BT', "Bottom->Top"),
+            ))
+        form = GraphForm(data={'execution_date': dttm.isoformat(), 'arrange': arrange})
 
         task_instances = {
             ti.task_id: utils.alchemy_to_dict(ti)
@@ -1305,6 +1311,7 @@ class Airflow(BaseView):
             width=request.args.get('width', "100%"),
             height=request.args.get('height', "800"),
             execution_date=dttm.isoformat(),
+            state_token=state_token(dr_state),
             doc_md=doc_md,
             arrange=arrange,
             operators=sorted(
@@ -1673,11 +1680,15 @@ def task_instance_link(v, c, m, p):
         """.format(**locals()))
 
 
-def state_f(v, c, m, p):
-    color = State.color(m.state)
+def state_token(state):
+    color = State.color(state)
     return Markup(
         '<span class="label" style="background-color:{color};">'
-        '{m.state}</span>'.format(**locals()))
+        '{state}</span>'.format(**locals()))
+
+
+def state_f(v, c, m, p):
+    return state_token(m.state)
 
 
 def duration_f(v, c, m, p):
@@ -1719,6 +1730,21 @@ class DagRunModelView(ModelViewOnly):
         state=state_f,
         start_date=datetime_f,
         dag_id=dag_link)
+    @action(
+        'set_running', "Set state to 'running'", None)
+    @utils.provide_session
+    def action_set_running(self, ids, session=None):
+        try:
+            DR = models.DagRun
+            count = 0
+            for dr in session.query(DR).filter(DR.id.in_(ids)).all():
+                count += 1
+            flash("{} dag runs were set to 'running'".format(ids))
+        except Exception as ex:
+            if not self.handle_view_exception(ex):
+                raise Exception("Ooops")
+            flash('Failed to set state', 'error')
+
 mv = DagRunModelView(models.DagRun, Session, name="DAG Runs", category="Browse")
 admin.add_view(mv)
 
